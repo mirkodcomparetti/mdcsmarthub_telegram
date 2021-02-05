@@ -1,0 +1,15 @@
+[Unit]
+Description=The MDC smarthome telegram bot
+After=multi-user.target
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/mdcsmarthub_telegram
+ExecStart=/usr/bin/python3 /etc/mdc/mdcsmarthub_telegram.py
+Restart=on-failure
+RestartForceExitStatus=SIGPIPE
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

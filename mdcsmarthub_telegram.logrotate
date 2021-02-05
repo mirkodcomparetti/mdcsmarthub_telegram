@@ -1,0 +1,9 @@
+/var/log/mdc/mdcsmarthub_telegram.log
+{
+    rotate 6
+    monthly
+    maxsize 2M
+    compress
+    missingok
+    notifempty
+}
