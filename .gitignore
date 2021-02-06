@@ -10,6 +10,7 @@
 **/IEC61499/Log
 **/.vs
 **/*.bak
+**/*.local
 **/*.mv.db
 **/*.trace.db
 **/src-gen
