@@ -2,26 +2,28 @@
 """
 Simple Bot to handle the MDC SmartHome
 """
-import json
 import os
 import logging
-import paho.mqtt.client as mqtt
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+import paho.mqtt.publish as publish
+from paho import mqtt
 import uuid
-import json
 from rfc3986 import urlparse
-import signal
-from telegram import Update, KeyboardButton
-from telegram.ext import Updater, CommandHandler, MessageHandler, ConversationHandler, Filters, CallbackContext
+import pytz
+import json
+from influxdb_client import InfluxDBClient, Point, Dialect
 
 
 class TelegramBotCore:
     """TelegramBotCore app."""
 
-    def __init__(self, mqttclient):
+    def __init__(self, mqtt_client, db_client):
         """Init TelegramBotCore class."""
         self.logger = logging.getLogger("mdcsmarthub_telegram" + ".TelegramBotCore")
         self.logger.info("Begin initialize class TelegramBotCore")
-        self.mqtt_client = mqttclient
+        self.mqtt_instance = mqtt_client
+        self.db_instance = db_client
         # self.logger.debug("Capturing signals")
         # signal.signal(signal.SIGINT, self._cleanup)
         # signal.signal(signal.SIGTERM, self._cleanup)
@@ -84,11 +86,13 @@ class TelegramBotCore:
         if not self._check_chat_id(update):
             self._refuse(update)
             return
-        update.message.reply_markdown('Working on ledwall')
+        update.message.reply_markdown('Sending message on ledwall')
+        resultdata = self.db_instance.get_last_data()
         msg = {
-            "ledwall": update.message.chat.first_name
+            "ledwall": 'D {} - U {} - P {}'.format(resultdata["DownloadBandwidth"], resultdata["UploadBandwidth"],
+                                                   resultdata["PingLatency"])
         }
-        self.mqtt_client.send_message(json.dumps(msg))
+        self.mqtt_instance.send_message(msg)
 
     def _lastdata(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /lastdata is issued."""
@@ -96,7 +100,12 @@ class TelegramBotCore:
         if not self._check_chat_id(update):
             self._refuse(update)
             return
-        update.message.reply_markdown('Working on lastdata')
+        resultdata = self.db_instance.get_last_data()
+        local_tz = pytz.timezone("Europe/Rome")
+        resultdatatime = resultdata["time"].astimezone(local_tz).strftime("%d/%m/%Y@%H:%M:%S")
+        update.message.reply_markdown('Here you can find your last speedtest data:\n- When: {}\n- Download: {}Mbps\n- '
+                                      'Upload: {}Mbps\n- Ping: {}ms'.format(resultdatatime, resultdata[
+            "DownloadBandwidth"], resultdata["UploadBandwidth"], resultdata["PingLatency"]))
 
     def _generic(self, update: Update, context: CallbackContext) -> None:
         """Generic reponse to a message."""
@@ -129,17 +138,13 @@ class MqttClientCore:
         self.logger = logging.getLogger("mdcsmarthub_telegram" + ".MqttClientCore")
         self.logger.info("Begin initialize class MqttClientCore")
         topic_prefix = os.environ.get('MDCSMARTHUB_MQTT_TOPIC_PREFIX', "telegrambot")
-        self.mqtt_topic_prefix = topic_prefix if topic_prefix.endswith("/") else (topic_prefix + "/")
-        self.mqtt_broker_url = None
-        self.mqtt_broker_port = None
-        self.mqtt_broker_user = None
+        self.topic_prefix = topic_prefix if topic_prefix.endswith("/") else (topic_prefix + "/")
+        self.broker_url = None
+        self.broker_port = None
+        self.broker_user = None
         if not self._validate_info(os.environ.get('MDCSMARTHUB_MQTT_BROKER', "mqtt://test.mosquitto.org:1883")):
             self.logger.error("Broker information not valid")
             return
-
-        self.mqtt_client = mqtt.Client(client_id=str(uuid.uuid4()))
-        self.mqtt_client.on_connect = self._on_connect
-        self.mqtt_client.on_publish = self._on_publish
 
         self.logger.info("Done initialize class MqttClientCore")
 
@@ -148,29 +153,20 @@ class MqttClientCore:
         parseduri = urlparse(broker_info)
         if not (parseduri.scheme in ["mqtt", "ws"]):
             return False
-        self.mqtt_broker_url = parseduri.host
-        self.mqtt_broker_port = parseduri.port
-        self.mqtt_broker_user = parseduri.userinfo
-        self.logger.debug("broker_user {}".format(self.mqtt_broker_user))
-        self.logger.debug("broker_url {}, broker_port: {}".format(self.mqtt_broker_url, self.mqtt_broker_port))
-        if not (self.mqtt_broker_url and self.mqtt_broker_port):
+        self.broker_url = parseduri.host
+        self.broker_port = parseduri.port
+        self.broker_user = parseduri.userinfo
+        self.logger.debug("broker_user {}".format(self.broker_user))
+        self.logger.debug("broker_url {}, broker_port: {}".format(self.broker_url, self.broker_port))
+        if not (self.broker_url and self.broker_port):
             return False
         return True
 
-    def _on_connect(self, client, userdata, flags, rc):
-        self.logger.info("Connected with result code " + str(rc))
-
-    def _on_publish(self, client, userdata, result):
-        pass
-
-    def connect(self):
-        if self.mqtt_broker_url and self.mqtt_broker_port:
-            self.logger.debug("{}:{}".format(self.mqtt_broker_url, self.mqtt_broker_port))
-            self.mqtt_client.connect(self.mqtt_broker_url, self.mqtt_broker_port, 30)
-
     def send_message(self, json_message):
-        if self.mqtt_client.is_connected():
-            self.mqtt_client.publish(self.mqtt_topic_prefix + "commands", payload=json_message, qos=0, retain=False)
+        self.logger.debug("MQTT send message")
+        publish.single(self.topic_prefix + "commands", payload=json.dumps(json_message), qos=0, retain=False,
+                       hostname=self.broker_url, port=self.broker_port, client_id=str(uuid.uuid4()), keepalive=60,
+                       will=None, auth=None, tls=None, transport="tcp")
 
 
 class DbConnector:
@@ -180,30 +176,64 @@ class DbConnector:
         """Init DbConnector class."""
         self.logger = logging.getLogger("mdcsmarthub_telegram" + ".DbConnector")
         self.logger.info("Begin initialize class DbConnector")
-        self.db_url = None
-        self.db_bucket = os.environ.get('MDCSMARTHUB_DB_BUCKET')
-        self.db_org = os.environ.get('MDCSMARTHUB_DB_ORG')
-        self.db_token = os.environ.get('MDCSMARTHUB_DB_TOKEN')
+        self.url = None
+        self.measurement = os.environ.get('MDCSMARTHUB_DB_MEASUREMENT')
+        self.bucket = os.environ.get('MDCSMARTHUB_DB_BUCKET')
+        self.org = os.environ.get('MDCSMARTHUB_DB_ORG')
+        self.token = os.environ.get('MDCSMARTHUB_DB_TOKEN')
         if not self._validate_info(os.environ.get('MDCSMARTHUB_DB_URL', 'http://localhost:8086')):
             return
 
+        self.query_string = 'import "math" \
+            from(bucket: "' + self.bucket + '") \
+              |> range(start: -1d) \
+              |> filter(fn: (r) => r["_measurement"] == "' + self.measurement + '" and ( \
+                r[\"_field\"] == \"DownloadBandwidth\" or \
+                r[\"_field\"] == \"UploadBandwidth\" or \
+                r[\"_field\"] == \"PingLatency\")\
+              ) \
+              |> last() \
+              |> group() \
+              |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value") \
+              |> keep(columns: ["_time", "DownloadBandwidth", "UploadBandwidth", "PingLatency"]) \
+              |> map(fn: (r) => ({ r with DownloadBandwidth: math.round(x: (r.DownloadBandwidth * 8.0 / 10000.0)) / 100.0 })) \
+              |> map(fn: (r) => ({ r with UploadBandwidth: math.round(x: (r.UploadBandwidth * 8.0 / 10000.0)) / 100.0 }))'
         self.logger.info("Done initialize class DbConnector")
 
     def _validate_info(self, broker_info) -> False:
-        self.logger.debug("Validating " + broker_info)
-        parseduri = urlparse(broker_info)
-        if not (parseduri.scheme in ["http", "https"]):
+        self.logger.info("Validating " + broker_info)
+        parsed_uri = urlparse(broker_info)
+        if not (parsed_uri.scheme in ["http", "https"]):
             return False
-        self.logger.debug("host {}, port: {}".format(parseduri.host, parseduri.port))
-        if not parseduri.host:
+        if not parsed_uri.host:
             return False
-        self.db_url = "{}://{}".format(parseduri.scheme,
-                                       parseduri.host if not parseduri.port else "{}:{}".format(parseduri.host,
-                                                                                                parseduri.port))
-        if not (self.db_url and self.db_bucket and self.db_org and self.db_token):
+        self.url = "{}://{}".format(parsed_uri.scheme,
+                                    parsed_uri.host if not parsed_uri.port else "{}:{}".format(parsed_uri.host,
+                                                                                               parsed_uri.port))
+        if not (self.url and self.bucket and self.org and self.token and self.measurement):
             return False
-        self.logger.debug("db_url {}, db_org: {}, db_token: {}, db_bucket: {}".format(self.db_url, self.db_org, self.db_token, self.db_bucket))
+        self.logger.debug(
+            "url {}, org: {}, bucket: {}, measurement: {}, token: {}".format(self.url, self.org, self.bucket,
+                                                                             self.measurement, self.token))
         return True
+
+    def get_last_data(self) -> None:
+        db_client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
+
+        db_data = db_client.query_api().query_stream(query=self.query_string, org=self.org)
+        out_data = {}
+        for record in db_data:
+            self.logger.debug(
+                f'Time {record["_time"]} Down {record["DownloadBandwidth"]}, UploadBandwidth {record["UploadBandwidth"]}, Ping {record["PingLatency"]}')
+            out_data = record.values
+            out_data["time"] = out_data.pop("_time")
+            del out_data["result"]
+            del out_data["table"]
+        self.logger.debug(out_data)
+
+        db_client.__del__()
+
+        return out_data
 
 
 # Enable logging
@@ -219,9 +249,8 @@ if __name__ == "__main__":
     # Start MDCSmartHub Telegram app
     logger.info("Starting MDCSmartHub Telegram service")
     mqtt_instance = MqttClientCore()
-    mqtt_instance.connect()
     db_instance = DbConnector()
-    bot_instance = TelegramBotCore(mqtt_instance)
+    bot_instance = TelegramBotCore(mqtt_instance, db_instance)
     logger.info("Run main bot loop - wait for stop signal")
     bot_instance.loop()
     logger.info("Stopping main loop")
