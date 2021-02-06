@@ -78,7 +78,8 @@ class TelegramBotCore:
             self._refuse(update)
             return
         update.message.reply_markdown(
-            'Possible commands are:\n- /ledwall: write on ledwall\n- /lastdata: write lastdata.')
+            'Possible commands are:\n- /ledwall: write last speedtest data on LED wall\n- /lastdata: respond with '
+            'last speedtest data.')
 
     def _ledwall(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /ledwall is issued."""
