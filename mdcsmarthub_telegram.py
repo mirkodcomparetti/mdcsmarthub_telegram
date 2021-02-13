@@ -13,6 +13,7 @@ from rfc3986 import urlparse
 import pytz
 import json
 from influxdb_client import InfluxDBClient, Point, Dialect
+import re
 
 
 class TelegramBotCore:
@@ -35,8 +36,9 @@ class TelegramBotCore:
         # on different commands - answer in Telegram
         self.dispatcher.add_handler(CommandHandler("start", self._start))
         self.dispatcher.add_handler(CommandHandler("help", self._help))
-        self.dispatcher.add_handler(CommandHandler("ledwall", self._ledwall))
-        self.dispatcher.add_handler(CommandHandler("lastdata", self._lastdata))
+        self.dispatcher.add_handler(CommandHandler("getlastspeed", self._replylastspeed))
+        self.dispatcher.add_handler(CommandHandler("writemessage", self._writemessage))
+        self.dispatcher.add_handler(CommandHandler("writelastspeed", self._writelastspeed))
         # on noncommand i.e message - echo the message on Telegram
         self.dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, self._generic))
 
@@ -81,21 +83,39 @@ class TelegramBotCore:
             'Possible commands are:\n- /ledwall: write last speedtest data on LED wall\n- /lastdata: respond with '
             'last speedtest data.')
 
-    def _ledwall(self, update: Update, context: CallbackContext) -> None:
+    def _write_ledwall(self, msg_data) -> None:
+        """Write on ledwall."""
+        self.logger.debug("Writing on ledwall: {}".format(msg_data))
+        msg = {
+            "ledwall": msg_data
+        }
+        self.mqtt_instance.send_message(msg)
+
+    def _writemessage(self, update: Update, context: CallbackContext) -> None:
+        """Send a message when the command /message is issued."""
+        self.logger.debug("Running message action")
+        if not self._check_chat_id(update):
+            self._refuse(update)
+            return
+        returnmsg = re.sub(r'^\W*\w+\W*', '', update.message.text)
+        if not returnmsg:
+            update.message.reply_markdown('No message to print on ledwall')
+            return
+        update.message.reply_markdown('Sending custom message on ledwall')
+        self._write_ledwall(returnmsg)
+
+    def _writelastspeed(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /ledwall is issued."""
         self.logger.debug("Running ledwall action")
         if not self._check_chat_id(update):
             self._refuse(update)
             return
-        update.message.reply_markdown('Sending message on ledwall')
+        update.message.reply_markdown('Writing last speedtest data on ledwall')
         resultdata = self.db_instance.get_last_data()
-        msg = {
-            "ledwall": 'D {} - U {} - P {}'.format(resultdata["DownloadBandwidth"], resultdata["UploadBandwidth"],
-                                                   resultdata["PingLatency"])
-        }
-        self.mqtt_instance.send_message(msg)
+        self._write_ledwall('D {} - U {} - P {}'.format(resultdata["DownloadBandwidth"], resultdata["UploadBandwidth"],
+                                                   resultdata["PingLatency"]))
 
-    def _lastdata(self, update: Update, context: CallbackContext) -> None:
+    def _replylastspeed(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /lastdata is issued."""
         self.logger.debug("Running lastdata action")
         if not self._check_chat_id(update):
