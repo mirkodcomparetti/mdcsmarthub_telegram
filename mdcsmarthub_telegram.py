@@ -14,6 +14,7 @@ import pytz
 import json
 from influxdb_client import InfluxDBClient, Point, Dialect
 import re
+from googlehomepush import GoogleHome
 
 
 class TelegramBotCore:
@@ -43,6 +44,11 @@ class TelegramBotCore:
         self.dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, self._generic))
 
         self.allowedchatids = [i for i in os.environ.get('MDCSMARTHUB_TELEGRAM_CHATID').split(" ")]
+
+        self.googlehome = None
+        self.googlehomename = os.getenv('MDCSMARTHUB_GOOGLE_HOMEDEVICE', None)
+        if self.googlehomename:
+            self.googlehome = GoogleHome(host=self.googlehomename)
 
         self.logger.info("Done initialize class TelegramBotCore")
 
@@ -90,6 +96,8 @@ class TelegramBotCore:
             "ledwall": msg_data
         }
         self.mqtt_instance.send_message(msg)
+        # if self.googlehome is not None:
+        #     self.googlehome.say(text=msg_data, lang='it')
 
     def _writemessage(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /message is issued."""
@@ -110,10 +118,16 @@ class TelegramBotCore:
         if not self._check_chat_id(update):
             self._refuse(update)
             return
-        update.message.reply_markdown('Writing last speedtest data on ledwall')
-        resultdata = self.db_instance.get_last_data()
-        self._write_ledwall('D {} - U {} - P {}'.format(resultdata["DownloadBandwidth"], resultdata["UploadBandwidth"],
-                                                   resultdata["PingLatency"]))
+        returnmsg = re.sub(r'^\W*\w+\W*', '', update.message.text)
+        if not returnmsg:
+            update.message.reply_markdown('Missing data in request')
+            return
+        resultdata = self.db_instance.get_last_data(returnmsg)
+        if resultdata:
+            update.message.reply_markdown('Writing last speedtest data on ledwall')
+            self._write_ledwall('D {} - U {} - P {}'.format(resultdata["DownloadBandwidth"], resultdata["UploadBandwidth"], resultdata["PingLatency"]))
+        else:
+            update.message.reply_markdown('Error in response format')
 
     def _replylastspeed(self, update: Update, context: CallbackContext) -> None:
         """Send a message when the command /lastdata is issued."""
@@ -121,12 +135,19 @@ class TelegramBotCore:
         if not self._check_chat_id(update):
             self._refuse(update)
             return
-        resultdata = self.db_instance.get_last_data()
-        local_tz = pytz.timezone("Europe/Rome")
-        resultdatatime = resultdata["time"].astimezone(local_tz).strftime("%d/%m/%Y@%H:%M:%S")
-        update.message.reply_markdown('Here you can find your last speedtest data:\n- When: {}\n- Download: {}Mbps\n- '
-                                      'Upload: {}Mbps\n- Ping: {}ms'.format(resultdatatime, resultdata[
+        returnmsg = re.sub(r'^\W*\w+\W*', '', update.message.text)
+        if not returnmsg:
+            update.message.reply_markdown('Missing data in request')
+            return
+        resultdata = self.db_instance.get_last_data(returnmsg)
+        if resultdata:
+            local_tz = pytz.timezone("Europe/Rome")
+            resultdatatime = resultdata["time"].astimezone(local_tz).strftime("%d/%m/%Y@%H:%M:%S")
+            update.message.reply_markdown('Here you can find your last speedtest data:\n- When: {}\n- Download: {'
+                                          '}Mbps\n- Upload: {}Mbps\n- Ping: {}ms'.format(resultdatatime, resultdata[
             "DownloadBandwidth"], resultdata["UploadBandwidth"], resultdata["PingLatency"]))
+        else:
+            update.message.reply_markdown('Error in request format')
 
     def _generic(self, update: Update, context: CallbackContext) -> None:
         """Generic reponse to a message."""
@@ -208,21 +229,26 @@ class DbConnector:
         self.query_string = 'import "math" \
             from(bucket: "' + self.bucket + '") \
               |> range(start: -1d) \
-              |> filter(fn: (r) => r["_measurement"] == "' + self.measurement + '" and ( \
-                r[\"_field\"] == \"DownloadBandwidth\" or \
-                r[\"_field\"] == \"UploadBandwidth\" or \
-                r[\"_field\"] == \"PingLatency\")\
+              |> filter(fn: (r) => \
+                r["host"] == \"%s\" and \
+                r["_measurement"] == "' + self.measurement + '" and ( \
+                  r["_field"] == \"DownloadBandwidth\" or \
+                  r["_field"] == \"UploadBandwidth\" or \
+                  r["_field"] == \"PingLatency\" \
+                ) \
               ) \
+              |> keep(columns: ["_time", "_field", "_value"]) \
+              |> sort(columns: ["_time"], desc: false) \
               |> last() \
-              |> group() \
-              |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value") \
-              |> keep(columns: ["_time", "DownloadBandwidth", "UploadBandwidth", "PingLatency"]) \
-              |> map(fn: (r) => ({ r with DownloadBandwidth: math.round(x: (r.DownloadBandwidth * 8.0 / 10000.0)) / 100.0 })) \
-              |> map(fn: (r) => ({ r with UploadBandwidth: math.round(x: (r.UploadBandwidth * 8.0 / 10000.0)) / 100.0 }))'
+              |> map(fn: (r) => ({ \
+                r with _value: if (r._field == "DownloadBandwidth" or r._field == "UploadBandwidth") then math.round(x: (r._value * 8.0 / 10000.0)) / 100.0 else r._value \
+                }) \
+              ) \
+              |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")'
         self.logger.info("Done initialize class DbConnector")
 
     def _validate_info(self, broker_info) -> False:
-        self.logger.info("Validating " + broker_info)
+        self.logger.debug("Validating " + broker_info)
         parsed_uri = urlparse(broker_info)
         if not (parsed_uri.scheme in ["http", "https"]):
             return False
@@ -238,21 +264,22 @@ class DbConnector:
                                                                              self.measurement, self.token))
         return True
 
-    def get_last_data(self) -> None:
-        db_client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
-
-        db_data = db_client.query_api().query_stream(query=self.query_string, org=self.org)
+    def get_last_data(self, hostsname=None) -> None:
         out_data = {}
-        for record in db_data:
-            self.logger.debug(
-                f'Time {record["_time"]} Down {record["DownloadBandwidth"]}, UploadBandwidth {record["UploadBandwidth"]}, Ping {record["PingLatency"]}')
-            out_data = record.values
-            out_data["time"] = out_data.pop("_time")
-            del out_data["result"]
-            del out_data["table"]
-        self.logger.debug(out_data)
+        if hostsname:
+            db_client = InfluxDBClient(url=self.url, token=self.token, org=self.org)
+            self.logger.debug(self.query_string % hostsname)
+            db_data = db_client.query_api().query_stream(query=(self.query_string % hostsname), org=self.org)
+            for record in db_data:
+                self.logger.debug(
+                    f'Time {record["_time"]} Down {record["DownloadBandwidth"]}, UploadBandwidth {record["UploadBandwidth"]}, Ping {record["PingLatency"]}')
+                out_data = record.values
+                out_data["time"] = out_data.pop("_time")
+                del out_data["result"]
+                del out_data["table"]
+            self.logger.debug(out_data)
 
-        db_client.__del__()
+            db_client.__del__()
 
         return out_data
 
