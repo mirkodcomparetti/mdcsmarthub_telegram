@@ -125,7 +125,7 @@ class TelegramBotCore:
         resultdata = self.db_instance.get_last_data(returnmsg)
         if resultdata:
             update.message.reply_markdown('Writing last speedtest data on ledwall')
-            self._write_ledwall('D {} - U {} - P {}'.format(resultdata["DownloadBandwidth"], resultdata["UploadBandwidth"], resultdata["PingLatency"]))
+            self._write_ledwall('Down {} - Up {} - Ping {}'.format(resultdata["DownloadBandwidth"], resultdata["UploadBandwidth"], resultdata["PingLatency"]))
         else:
             update.message.reply_markdown('Error in response format')
 
